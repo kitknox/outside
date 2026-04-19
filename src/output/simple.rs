@@ -4,7 +4,7 @@ use crate::Settings;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_TEMPLATE: &str =
-    "{weather_description} {temperature | round}{temperature_unit} | Wind {wind_speed | round}{wind_gusts | round}{{if precipitation_chance}} | Precipitation {precipitation_chance}%{{endif}}";
+    "{weather_description} {temperature | round}{temperature_unit} | Wind {wind_speed | round}  {wind_gusts | round}{{if precipitation_chance}} | Precipitation {precipitation_chance}%{{endif}}";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SimpleOutput {

@@ -49,7 +49,7 @@ impl Output for DetailedOutput {
         template_parts.push("    Sunset:      {sunset}".to_string());
         template_parts.push("".to_string());
         template_parts.push("    {{ for day in forecast -}}".to_string());
-        template_parts.push("    {day.date}    {day.temperature_low | round}-{day.temperature_high | round}{temperature_unit} - {day.weather_description}".to_string());
+        template_parts.push("    {day.date}    {day.temperature_low | round} → {day.temperature_high | round}{temperature_unit} {day.weather_description}".to_string());
         template_parts.push("    {{ endfor }}".to_string());
 
         let text_template = template_parts.join("\n");
