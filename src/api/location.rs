@@ -40,6 +40,12 @@ pub struct LocationData {
     pub longitude: f64,
     pub location: String,
     pub created_at: u64,
+    /// First-level admin division (US state, CA province, etc.). Empty when
+    /// the lookup didn't include one (legacy 2-part input or IP-based).
+    /// Added in 0.5.x — old savefile caches won't include it, which is fine:
+    /// `load_file(...).unwrap_or_default()` falls back to a fresh fetch.
+    #[serde(default)]
+    pub state: String,
 }
 
 impl LocationData {
@@ -63,32 +69,37 @@ impl LocationData {
         city.split_whitespace().map(stringcase::pascal_case).collect::<Vec<_>>().join(" ")
     }
 
-    /// Normalizes a location string to consistent "City, COUNTRY" format.
+    /// Normalizes a location string to consistent format.
     ///
-    /// This helper function takes a location string and returns it in normalized format:
-    /// - City names are converted to CamelCase
-    /// - Country codes are converted to uppercase
+    /// Accepts either:
+    ///   - "City, CountryCode" → "City, COUNTRY"
+    ///   - "City, State, CountryCode" → "City, State, COUNTRY"
     ///
-    /// # Arguments
-    ///
-    /// * `location` - The location string to normalize (e.g., "new york, us")
-    ///
-    /// # Returns
-    ///
-    /// The normalized location string (e.g., "New York, US")
+    /// Cities go through `normalize_city_name`; country code uppercases;
+    /// state is expanded from a 2-letter US abbreviation to full name if it
+    /// matches one, otherwise passed through with whitespace trimmed and
+    /// title-cased for consistency.
     pub fn normalize_location_string(location: &str) -> String {
         if location.is_empty() {
             return location.to_string();
         }
 
         let parts: Vec<&str> = location.split(',').collect();
-        if parts.len() == 2 {
-            let city = parts[0].trim();
-            let country = parts[1].trim().to_uppercase();
-            let normalized_city = Self::normalize_city_name(city);
-            format!("{normalized_city}, {country}")
-        } else {
-            location.to_string()
+        match parts.len() {
+            2 => {
+                let city = Self::normalize_city_name(parts[0].trim());
+                let country = parts[1].trim().to_uppercase();
+                format!("{city}, {country}")
+            }
+            3 => {
+                let city = Self::normalize_city_name(parts[0].trim());
+                let raw_state = parts[1].trim();
+                let state = crate::api::geolocation::expand_us_state(raw_state)
+                    .unwrap_or_else(|| Self::normalize_city_name(raw_state));
+                let country = parts[2].trim().to_uppercase();
+                format!("{city}, {state}, {country}")
+            }
+            _ => location.to_string(),
         }
     }
 
@@ -122,7 +133,11 @@ impl LocationData {
 
         // Update location string with normalized format
         if !self.city.is_empty() && !self.country_code.is_empty() {
-            self.location = format!("{}, {}", self.city, self.country_code);
+            if self.state.is_empty() {
+                self.location = format!("{}, {}", self.city, self.country_code);
+            } else {
+                self.location = format!("{}, {}, {}", self.city, self.state, self.country_code);
+            }
         }
     }
 
@@ -194,21 +209,27 @@ impl LocationData {
     /// - The geocoding or IP location API request fails
     /// - No results are found for the specified location
     fn lookup(l: String) -> Result<Self> {
-        if !l.is_empty() {
-            let parts: Vec<&str> = l.split(',').collect();
-            if parts.len() == 2 {
-                let name = parts[0].trim();
+        if l.is_empty() {
+            return iplocation::IPLocation::fetch("", "");
+        }
+        let parts: Vec<&str> = l.split(',').collect();
+        match parts.len() {
+            2 => {
+                let name = Self::normalize_city_name(parts[0].trim());
                 let country_code = parts[1].trim().to_uppercase();
-
-                // Normalize the city name to CamelCase for consistency
-                let normalized_name = Self::normalize_city_name(name);
-
-                geolocation::GeoLocation::fetch(&normalized_name, &country_code)
-            } else {
-                Err(anyhow::anyhow!("Invalid location format. Use 'City, CountryCode'."))
+                geolocation::GeoLocation::fetch(&name, &country_code)
             }
-        } else {
-            iplocation::IPLocation::fetch("", "")
+            3 => {
+                // "City, State, CountryCode" — disambiguates ambiguous
+                // names (e.g. Boston, MA, US vs. Boston, GA, US).
+                let name = Self::normalize_city_name(parts[0].trim());
+                let state = parts[1].trim();
+                let country_code = parts[2].trim().to_uppercase();
+                geolocation::GeoLocation::fetch_filtered(&name, state, &country_code)
+            }
+            _ => Err(anyhow::anyhow!(
+                "Invalid location format. Use 'City, CountryCode' or 'City, State, CountryCode'."
+            )),
         }
     }
 }

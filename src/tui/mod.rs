@@ -6,12 +6,17 @@ pub mod state_manager;
 pub mod ui_components;
 pub mod weather_display;
 
+#[cfg(target_os = "wasi")]
+pub mod wasi_backend;
+
 use crate::context::Context;
 use crate::output::Output;
 use crate::Settings;
 use async_operations::WeatherFetcher;
 use cursive::views::ResizedView;
-use cursive::{Cursive, CursiveExt};
+use cursive::Cursive;
+#[cfg(not(target_os = "wasi"))]
+use cursive::CursiveExt;
 use keyboard_handlers::KeyboardHandlers;
 use location_manager::LocationManager;
 use state_manager::TuiStateManager;
@@ -63,7 +68,12 @@ impl TuiOutput {
     /// displayed across the entire terminal with location management on the right.
     /// Users can navigate using keyboard controls and exit by pressing 'q' or Escape.
     fn run_tui(&self) {
+        // Native builds get cursive's default crossterm backend; WASI gets
+        // our custom backend that talks to rootshell_terminal_* + ANSI.
+        #[cfg(not(target_os = "wasi"))]
         let mut siv = Cursive::default();
+        #[cfg(target_os = "wasi")]
+        let mut siv = Cursive::new();
 
         // Set up theme with terminal default background and no shadows
         UiComponents::setup_theme(&mut siv);
@@ -100,7 +110,12 @@ impl TuiOutput {
         // Set up automatic refresh when cache expires
         weather_fetcher.setup_auto_refresh(&mut siv);
 
-        // Run the TUI
+        // Run the TUI. Native uses the CursiveExt::run() shortcut that
+        // auto-selects the crossterm backend; WASI hands cursive our backend
+        // initializer directly.
+        #[cfg(not(target_os = "wasi"))]
         siv.run();
+        #[cfg(target_os = "wasi")]
+        siv.run_with(|| crate::tui::wasi_backend::WasiBackend::init());
     }
 }

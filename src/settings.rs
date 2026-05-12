@@ -93,8 +93,13 @@ pub struct SimpleConfig {
 /// A multi-purpose weather client for your terminal
 #[cli_settings_clap = "#[derive(clap::Parser)]#[command(name = \"outside\", version, verbatim_doc_comment)]"]
 pub struct Settings {
-    /// Location to fetch weather data for,
-    /// leave blank to auto-detect using your IP address
+    /// Location to fetch weather data for. Formats accepted:
+    ///   - "City, CountryCode"           e.g. "London, GB"
+    ///   - "City, State, CountryCode"    e.g. "Boston, MA, US"
+    /// State (admin1) disambiguates cities with shared names — Open-Meteo's
+    /// geocoding API has no state filter, so we fetch top results and
+    /// match `admin1` ourselves. US two-letter abbreviations are accepted.
+    /// Leave blank to auto-detect via IP.
     #[cli_settings_file]
     #[cli_settings_clap = "#[arg(short, long, verbatim_doc_comment)]"]
     pub location: String,

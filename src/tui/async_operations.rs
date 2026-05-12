@@ -7,6 +7,7 @@ use crate::tui::ui_components::UiComponents;
 use crate::tui::weather_display::WeatherDisplay;
 use cursive::views::{ProgressBar, TextView};
 use cursive::Cursive;
+#[cfg(not(target_os = "wasi"))]
 use std::thread;
 
 pub struct WeatherFetcher {
@@ -18,6 +19,11 @@ impl WeatherFetcher {
         Self { state_manager }
     }
 
+    /// Fetch weather for `location` and route the result through the supplied
+    /// callbacks. Native spawns a thread and dispatches via `cb_sink`. WASI
+    /// has neither — it runs the fetch synchronously on the UI thread,
+    /// repainting the "loading…" state first so users see something during
+    /// the brief freeze.
     pub fn fetch_and_update<F, E>(
         &self,
         location: String,
@@ -28,39 +34,56 @@ impl WeatherFetcher {
         F: Fn(&mut Cursive, &TuiStateManager, Context) + Send + 'static,
         E: Fn(&mut Cursive, &TuiStateManager, String) + Send + 'static,
     {
-        // Set loading state
         self.state_manager.set_loading(true);
-
-        // Update display to show loading
         self.update_ui_loading(siv);
 
-        // Get a handle to the cursive instance for async update
-        let cb_sink = siv.cb_sink().clone();
-        let location_clone = location.clone();
-        let state_manager_clone = self.state_manager.clone();
-
-        // Spawn background thread to fetch weather data
-        thread::spawn(move || {
-            if let Ok(result) = Self::fetch_weather_for_location(&location_clone, &state_manager_clone) {
-                // Send callback to update UI on main thread
-                cb_sink
-                    .send(Box::new(move |s| {
-                        // Note: we don't update the currently_selected_location here since success_callback will handle it
-                        state_manager_clone.update_context(result.clone());
-                        success_callback(s, &state_manager_clone, result);
-                    }))
-                    .unwrap();
-            } else {
-                // Handle error case
-                let error_message = format!("Failed to fetch location data for: {location_clone}");
-                cb_sink
-                    .send(Box::new(move |s| {
-                        state_manager_clone.set_loading(false);
-                        error_callback(s, &state_manager_clone, error_message);
-                    }))
-                    .unwrap();
+        #[cfg(target_os = "wasi")]
+        {
+            // We can't force a paint of "Loading…" before the blocking fetch
+            // — cursive's redraws are tied to its run loop. So the UI shows
+            // stale state for the ~0.5–1s the fetch takes. Acceptable
+            // tradeoff for not having background threads under WASI.
+            let state_manager_clone = self.state_manager.clone();
+            match Self::fetch_weather_for_location(&location, &state_manager_clone) {
+                Ok(result) => {
+                    state_manager_clone.update_context(result.clone());
+                    success_callback(siv, &state_manager_clone, result);
+                }
+                Err(_) => {
+                    state_manager_clone.set_loading(false);
+                    let error_message = format!("Failed to fetch location data for: {location}");
+                    error_callback(siv, &state_manager_clone, error_message);
+                }
             }
-        });
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let cb_sink = siv.cb_sink().clone();
+            let location_clone = location.clone();
+            let state_manager_clone = self.state_manager.clone();
+
+            thread::spawn(move || {
+                if let Ok(result) =
+                    Self::fetch_weather_for_location(&location_clone, &state_manager_clone)
+                {
+                    cb_sink
+                        .send(Box::new(move |s| {
+                            state_manager_clone.update_context(result.clone());
+                            success_callback(s, &state_manager_clone, result);
+                        }))
+                        .unwrap();
+                } else {
+                    let error_message = format!("Failed to fetch location data for: {location_clone}");
+                    cb_sink
+                        .send(Box::new(move |s| {
+                            state_manager_clone.set_loading(false);
+                            error_callback(s, &state_manager_clone, error_message);
+                        }))
+                        .unwrap();
+                }
+            });
+        }
     }
 
     pub fn switch_location(&self, siv: &mut Cursive, location: String) {
@@ -69,7 +92,6 @@ impl WeatherFetcher {
             location,
             siv,
             move |s, state_manager, context| {
-                // Update both context and currently selected location
                 state_manager.update_context_with_location(context, location_clone.clone());
                 UiComponents::update_weather_display_components(s, state_manager);
             },
@@ -84,7 +106,6 @@ impl WeatherFetcher {
         self.state_manager.toggle_units();
         self.state_manager.set_loading(true);
 
-        // Update display to show units switching
         siv.call_on_name(WEATHER_HEADER_NAME, |view: &mut TextView| {
             view.set_content(WeatherDisplay::format_units_switching_message());
         });
@@ -95,31 +116,60 @@ impl WeatherFetcher {
             view.set_content("");
         });
 
-        let cb_sink = siv.cb_sink().clone();
-        let state_manager_clone = self.state_manager.clone();
-
-        thread::spawn(move || {
-            if let Ok(result) = Self::fetch_weather_for_location(&current_location, &state_manager_clone) {
-                let location_for_update = current_location.clone();
-                cb_sink
-                    .send(Box::new(move |s| {
-                        state_manager_clone.update_context_with_location(result, location_for_update);
-                        UiComponents::update_weather_display_components(s, &state_manager_clone);
-                    }))
-                    .unwrap();
-            } else {
-                cb_sink
-                    .send(Box::new(move |s| {
-                        state_manager_clone.set_loading(false);
-                        Self::show_error_dialog(s, "Failed to fetch weather data with new units");
-                        // Revert to previous weather display
-                        UiComponents::update_weather_display_components(s, &state_manager_clone);
-                    }))
-                    .unwrap();
+        #[cfg(target_os = "wasi")]
+        {
+            // Same caveat as fetch_and_update: no forced repaint before the
+            // blocking fetch under WASI. Users see the prior weather data
+            // briefly, then it pops to the new units after the fetch.
+            let state_manager_clone = self.state_manager.clone();
+            match Self::fetch_weather_for_location(&current_location, &state_manager_clone) {
+                Ok(result) => {
+                    state_manager_clone
+                        .update_context_with_location(result, current_location.clone());
+                    UiComponents::update_weather_display_components(siv, &state_manager_clone);
+                }
+                Err(_) => {
+                    state_manager_clone.set_loading(false);
+                    Self::show_error_dialog(siv, "Failed to fetch weather data with new units");
+                    UiComponents::update_weather_display_components(siv, &state_manager_clone);
+                }
             }
-        });
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let cb_sink = siv.cb_sink().clone();
+            let state_manager_clone = self.state_manager.clone();
+
+            thread::spawn(move || {
+                if let Ok(result) =
+                    Self::fetch_weather_for_location(&current_location, &state_manager_clone)
+                {
+                    let location_for_update = current_location.clone();
+                    cb_sink
+                        .send(Box::new(move |s| {
+                            state_manager_clone
+                                .update_context_with_location(result, location_for_update);
+                            UiComponents::update_weather_display_components(s, &state_manager_clone);
+                        }))
+                        .unwrap();
+                } else {
+                    cb_sink
+                        .send(Box::new(move |s| {
+                            state_manager_clone.set_loading(false);
+                            Self::show_error_dialog(s, "Failed to fetch weather data with new units");
+                            UiComponents::update_weather_display_components(s, &state_manager_clone);
+                        }))
+                        .unwrap();
+                }
+            });
+        }
     }
 
+    /// Background auto-refresh. Native spawns a polling thread; WASI has no
+    /// threads, so this becomes a no-op and the cache simply ages until the
+    /// user triggers a fetch via the location-switch path.
+    #[cfg(not(target_os = "wasi"))]
     pub fn setup_auto_refresh(&self, siv: &mut Cursive) {
         let cb_sink = siv.cb_sink().clone();
         let state_manager_clone = self.state_manager.clone();
@@ -128,7 +178,6 @@ impl WeatherFetcher {
             thread::sleep(std::time::Duration::from_secs(AUTO_REFRESH_INTERVAL));
 
             if state_manager_clone.needs_refresh() {
-                // Fetch new data when cache expires
                 let current_location = state_manager_clone.get_current_location();
                 let state_for_refresh = state_manager_clone.clone();
 
@@ -137,15 +186,21 @@ impl WeatherFetcher {
                     fetcher.switch_location(s, current_location);
                 }));
             } else {
-                // Update display to show current cache age without fetching new data
                 let state_for_display = state_manager_clone.clone();
                 let _ = cb_sink.send(Box::new(move |s| {
-                    // Update cache_age in context to current time difference
                     state_for_display.update_cache_age();
                     UiComponents::update_weather_display_components(s, &state_for_display);
                 }));
             }
         });
+    }
+
+    #[cfg(target_os = "wasi")]
+    pub fn setup_auto_refresh(&self, _siv: &mut Cursive) {
+        // No threads under wasm32-wasip1, so auto-refresh is disabled. The
+        // cache_age progress bar still updates whenever the UI repaints, and
+        // any user action (Enter on the bookmarks list) triggers a fresh
+        // fetch through fetch_and_update.
     }
 
     fn update_ui_loading(&self, siv: &mut Cursive) {
@@ -175,11 +230,9 @@ impl WeatherFetcher {
     ) -> Result<Context, Box<dyn std::error::Error + Send + Sync>> {
         let mut settings = state_manager.get_settings();
 
-        // Handle special "Automatic" case for IP-based lookup
         if location == "Automatic" {
-            settings.location = String::new(); // Empty string triggers IP lookup
+            settings.location = String::new();
         } else {
-            // Parse location for geocoding API
             let parts: Vec<&str> = location.split(',').collect();
             if parts.len() != 2 {
                 return Err("Invalid location format".into());
@@ -187,14 +240,9 @@ impl WeatherFetcher {
             settings.location = location.to_string();
         }
 
-        // Fetch location data
         let location_data = LocationData::get_cached(settings.clone())?;
-
-        // Fetch weather data
         let weather_data =
             Weather::get_cached(location_data.latitude, location_data.longitude, settings.clone())?;
-
-        // Build context
         let context = Context::build(weather_data, location_data, settings);
 
         Ok(context)

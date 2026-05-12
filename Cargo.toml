@@ -11,8 +11,10 @@ repository = "https://github.com/BaconIsAVeg/outside"
 keywords = ["cli", "weather"]
 categories = ["command-line-utilities"]
 
+# Shared deps: pure-Rust, no platform features that would break wasm32-wasip1.
+# cursive lives here with default-features off so each target can pick its own
+# Backend impl (native = crossterm; wasi = our hand-rolled wasi_backend).
 [dependencies]
-isahc = { version = "1.7.2", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -23,20 +25,39 @@ cli-settings-derive = "0.3"
 anyhow = "1.0"
 
 url = "2.5.4"
-chrono = "0.4.41"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
 
 dirs-next = "2.0.0"
 savefile = "0.20"
 savefile-derive = "0.20"
 tinytemplate = "1.2.1"
+stringcase = "0.4"
+cursive = { version = "0.21", default-features = false }
+
+# Native target: full async stack + TLS via OpenSSL + crossterm TUI backend.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+isahc = { version = "1.7.2", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"] }
 tokio = { version = "1.46", features = ["rt-multi-thread", "time", "signal", "macros"] }
-cursive = "0.21"
-stringcase = "0.4"
 termsize = "0.1.9"
+cursive = { version = "0.21", default-features = false, features = ["crossterm-backend"] }
+
+# WASI target: no TLS crate (TLS handled host-side via rootshell), no tokio,
+# no crossterm. httparse parses HTTP/1.1 response heads; framing is handled by
+# Connection: close (read-to-EOF) so we skip chunked decoding entirely.
+[target.'cfg(target_os = "wasi")'.dependencies]
+httparse = "1.9"
 
 [dev-dependencies]
 tempfile = "3.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
+
+# Release profile for WASM (smaller binary). Native debug/release unchanged.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

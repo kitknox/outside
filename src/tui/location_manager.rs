@@ -7,10 +7,17 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Get the path to the bookmarks.yaml file in the config directory
+/// Get the path to the bookmarks.yaml file in the config directory.
+///
+/// Native: `~/.config/outside/bookmarks.yaml` (via XDG). WASI: the host sets
+/// `HOME=/` and no `XDG_CONFIG_HOME`, so we fall through to
+/// `/.config/outside/bookmarks.yaml` inside the sandbox. The final `/tmp`
+/// fallback is purely defensive — `home_dir()` is virtually always set.
 fn get_bookmarks_yaml_path() -> PathBuf {
     dirs_next::config_dir()
-        .unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default())
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+        .or_else(|| dirs_next::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(env!("CARGO_PKG_NAME"))
         .join("bookmarks.yaml")
 }

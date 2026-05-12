@@ -36,6 +36,9 @@ impl Location for IPLocation {
     /// - The JSON response cannot be parsed
     /// - Network connectivity issues prevent IP detection
     fn fetch(_: &str, _: &str) -> Result<LocationData> {
+        // ip-api.com's free tier is HTTP-only — HTTPS returns 403 (SSL is a
+        // paid feature). The WASI http client supports both transports, so
+        // PlainStream handles this URL while open-meteo still uses TLS.
         let base_url = "http://ip-api.com/json";
         let api_url = utils::urls::builder(base_url, vec![("fields", "33603794")]);
 
@@ -48,6 +51,10 @@ impl Location for IPLocation {
         let mut location_data = LocationData {
             city: loc.city.to_owned(),
             country_code: loc.country_code.to_owned(),
+            // IP geolocation doesn't include the admin1/state field with our
+            // current `fields` bitmask. Leaving empty; normalize() then
+            // formats the display as "City, COUNTRY" without state.
+            state: String::new(),
             latitude: loc.lat,
             longitude: loc.lon,
             location: "".to_string(),

@@ -5,34 +5,31 @@ pub mod settings;
 pub mod tui;
 pub mod utils;
 
+#[cfg(target_os = "wasi")]
+pub mod wasi;
+
 use crate::api::location::LocationData;
 use crate::api::weather;
 use crate::settings::{OutputFormat, Settings, Units};
 use anyhow::Result;
-use std::time::Duration;
-use tokio::signal;
-use tokio::time::interval;
 
 /// Main entry point for the outside weather CLI application.
 ///
-/// This function orchestrates the complete weather data pipeline:
-/// 1. Builds configuration from config file and CLI arguments
-/// 2. Resolves location data (with caching)
-/// 3. Fetches weather data from Open-Meteo API (with caching)
-/// 4. Builds context for template rendering
-/// 5. Renders and outputs the weather information in the specified format
+/// The flow is the same on both targets:
+/// 1. Build configuration from config file and CLI arguments
+/// 2. Resolve location data (with caching)
+/// 3. Fetch weather data (with caching)
+/// 4. Build context for template rendering
+/// 5. Render and output
 ///
-/// Supports both single-run mode and streaming mode for continuous output.
-/// In streaming mode, weather data is fetched and output at regular intervals
-/// until the program receives a termination signal.
-///
-/// # Returns
-///
-/// Returns `Ok(())` on success, or an error if any step fails.
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Native: tokio runtime, signal-based Ctrl-C, threads for TUI fetches.
+/// WASI: sync top-to-bottom, Ctrl-C handled host-side via cooked-mode kill,
+/// TUI fetches block the UI briefly (no threads).
+fn main() -> Result<()> {
     let config_file = dirs_next::config_dir()
-        .unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default())
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
+        .or_else(|| dirs_next::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join(env!("CARGO_PKG_NAME"))
         .join("config.yaml");
 
@@ -44,30 +41,62 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    if s.stream {
-        run_streaming_mode(s).await
-    } else {
-        run_single_mode(s).await
+    #[cfg(target_os = "wasi")]
+    {
+        run_wasi(s)
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        run_native(s)
     }
 }
 
-/// Runs the application in streaming mode for continuous output.
-///
-/// Outputs weather data at regular intervals until interrupted by a signal.
-/// This mode is particularly useful for status bars like Waybar that expect
-/// continuous JSON output from external commands.
-///
-/// # Arguments
-///
-/// * `settings` - Application configuration including interval and output format
-///
-/// # Returns
-///
-/// Returns `Ok(())` when gracefully shutdown, or an error if critical failure occurs.
+/// Native entry: bootstraps tokio explicitly (no #[tokio::main] so that the
+/// WASI build can stay sync) and dispatches to the streaming or single
+/// run-loop.
+#[cfg(not(target_os = "wasi"))]
+fn run_native(s: Settings) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        if s.stream {
+            run_streaming_mode(s).await
+        } else {
+            run_single_mode(s).await
+        }
+    })
+}
+
+/// WASI entry: sync top-to-bottom. The streaming loop uses `thread::sleep`
+/// rather than tokio timers; Ctrl-C in cooked mode kills the WASM process
+/// from the host side, so there's no signal handling inside this loop.
+#[cfg(target_os = "wasi")]
+fn run_wasi(s: Settings) -> Result<()> {
+    if s.stream {
+        // Emit immediately so users see something before the first interval.
+        if let Err(e) = output_weather_data_sync(&s) {
+            eprintln!("Error fetching initial weather data: {e}");
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(s.interval));
+            if let Err(e) = output_weather_data_sync(&s) {
+                eprintln!("Error fetching weather data: {e}");
+            }
+        }
+    }
+    output_weather_data_sync(&s)
+}
+
+/// Streaming mode (native only). Ticks every `settings.interval` seconds
+/// until Ctrl-C arrives via `tokio::signal`.
+#[cfg(not(target_os = "wasi"))]
 async fn run_streaming_mode(settings: Settings) -> Result<()> {
+    use std::time::Duration;
+    use tokio::signal;
+    use tokio::time::interval;
+
     let mut timer = interval(Duration::from_secs(settings.interval));
 
-    // Output immediately on startup
     if let Err(e) = output_weather_data(&settings).await {
         eprintln!("Error fetching initial weather data: {e}");
     }
@@ -80,7 +109,6 @@ async fn run_streaming_mode(settings: Settings) -> Result<()> {
             _ = timer.tick() => {
                 if let Err(e) = output_weather_data(&settings).await {
                     eprintln!("Error fetching weather data: {e}");
-                    // Continue running even if one fetch fails
                     continue;
                 }
             }
@@ -96,37 +124,24 @@ async fn run_streaming_mode(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-/// Runs the application in single-run mode.
-///
-/// Fetches weather data once, outputs it, and exits. This is the traditional
-/// behavior of the application.
-///
-/// # Arguments
-///
-/// * `settings` - Application configuration
-///
-/// # Returns
-///
-/// Returns `Ok(())` on success, or an error if any step fails.
+#[cfg(not(target_os = "wasi"))]
 async fn run_single_mode(settings: Settings) -> Result<()> {
     output_weather_data(&settings).await
 }
 
-/// Fetches weather data and outputs it according to the configured format.
-///
-/// This function encapsulates the core weather data pipeline that can be used
-/// in both single-run and streaming modes.
-///
-/// # Arguments
-///
-/// * `settings` - Application configuration
-///
-/// # Returns
-///
-/// Returns `Ok(())` on success, or an error if fetching or output fails.
+#[cfg(not(target_os = "wasi"))]
 async fn output_weather_data(settings: &Settings) -> Result<()> {
+    output_weather_data_sync(settings)
+}
+
+/// The core weather data pipeline. Sync — the underlying location and
+/// weather fetches are blocking on both targets (isahc and our wasi http
+/// client both return synchronously), so the native `async fn` wrappers
+/// above are effectively cosmetic.
+fn output_weather_data_sync(settings: &Settings) -> Result<()> {
     let loc = LocationData::get_cached(settings.clone())?;
-    let weather = weather::Weather::get_cached(loc.latitude, loc.longitude, settings.clone())?;
+    let weather =
+        weather::Weather::get_cached(loc.latitude, loc.longitude, settings.clone())?;
 
     let context = context::Context::build(weather, loc, settings.clone());
     let output = settings.output.render_fn()(context, settings.clone());

@@ -60,11 +60,15 @@ impl WeatherDisplay {
     }
 
     fn calculate_available_forecast_width() -> usize {
-        // Get actual terminal width using termsize crate
+        // Native: termsize hits TIOCGWINSZ. WASI: COLUMNS/LINES env vars set
+        // by the host at process launch (no SIGWINCH path).
+        #[cfg(not(target_os = "wasi"))]
         let terminal_width: usize = match termsize::get() {
             Some(size) => size.cols as usize,
-            None => 120, // Fallback for wide terminals if detection fails
+            None => 120,
         };
+        #[cfg(target_os = "wasi")]
+        let terminal_width: usize = crate::wasi::terminal::screen_size().0 as usize;
 
         // Account for location panel and margins
         // Location panel: LOCATION_LIST_WIDTH (24) + borders/spacing (~6)
