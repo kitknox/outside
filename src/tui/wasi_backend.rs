@@ -8,7 +8,11 @@
 //!   * Input: byte-at-a-time blocking reads from stdin (raw mode flipped on
 //!     during init via `rootshell_terminal_set_raw(1)`). A small state machine
 //!     decodes CSI/SS3 escape sequences into `cursive::event::Event`s.
-//!   * Size: read once from `COLUMNS` / `LINES` env vars (no SIGWINCH).
+//!   * Size: lazy-loaded from `COLUMNS` / `LINES` env vars on first read,
+//!     then kept live via DEC mode 2048 (in-band size reports). On init we
+//!     send `\x1b[?2048h`; libghostty on the rootshell host emits
+//!     `\x1b[48;rows;cols;py;px t` on every view resize, which the CSI parser
+//!     turns into `Event::WindowResize`.
 //!
 //! Cursive's docstring says `poll_event` "should return immediately" with
 //! `None` when no input is available. WASI fd_read on stdin is purely
@@ -29,7 +33,6 @@ use crate::wasi::terminal;
 
 pub struct WasiBackend {
     stdout: RefCell<BufWriter<io::Stdout>>,
-    size: Vec2,
     current_style: Cell<ColorPair>,
     /// Cursive's `process_events` is `while let Some(ev) = backend.poll_event()`
     /// — it drains all pending events before drawing. With a blocking stdin
@@ -46,19 +49,18 @@ impl WasiBackend {
     pub fn init() -> Box<dyn Backend> {
         terminal::set_raw(true);
 
-        let (cols, rows) = terminal::screen_size();
-        let size = Vec2::new(cols as usize, rows as usize);
+        // Prime the size cache from env vars before the first refresh.
+        let _ = terminal::screen_size();
 
         let mut stdout = BufWriter::new(io::stdout());
-        // Alt screen + hide cursor + clear + home cursor. Written eagerly so
-        // the user sees the TUI take over the terminal even if the first
-        // refresh() is delayed by a fetch.
-        let _ = stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        // Alt screen + hide cursor + clear + home cursor + enable DEC mode
+        // 2048 (in-band size reports). Written eagerly so the TUI takes over
+        // the terminal even if the first refresh() is delayed by a fetch.
+        let _ = stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?2048h");
         let _ = stdout.flush();
 
         Box::new(Self {
             stdout: RefCell::new(stdout),
-            size,
             current_style: Cell::new(ColorPair {
                 front: Color::TerminalDefault,
                 back: Color::TerminalDefault,
@@ -78,11 +80,11 @@ impl WasiBackend {
 
 impl Drop for WasiBackend {
     fn drop(&mut self) {
-        // Reset SGR, show cursor, leave alt screen.
+        // Reset SGR, show cursor, disable mode 2048, leave alt screen.
         let _ = self
             .stdout
             .borrow_mut()
-            .write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
+            .write_all(b"\x1b[0m\x1b[?25h\x1b[?2048l\x1b[?1049l");
         let _ = self.stdout.borrow_mut().flush();
         terminal::set_raw(false);
     }
@@ -113,7 +115,8 @@ impl Backend for WasiBackend {
     }
 
     fn screen_size(&self) -> Vec2 {
-        self.size
+        let (cols, rows) = terminal::screen_size();
+        Vec2::new(cols as usize, rows as usize)
     }
 
     fn move_to(&self, pos: Vec2) {
@@ -321,14 +324,15 @@ fn read_csi() -> Option<Event> {
 }
 
 fn read_csi_with_params(first_digit: u8) -> Option<Event> {
-    // Collect digits up to a non-digit final byte. Most apps emit one or two
-    // numeric params; we cap collection at 6 bytes to stay defensive.
+    // Collect digits and ';' separators up to a non-digit final byte. Mode
+    // 2048 size reports carry 5 params (48;rows;cols;pix_h;pix_w), so the cap
+    // accommodates that.
     let mut digits = vec![first_digit];
     let final_byte;
     loop {
         let b = read_byte()?;
         if b.is_ascii_digit() || b == b';' {
-            if digits.len() < 6 {
+            if digits.len() < 32 {
                 digits.push(b);
             }
         } else {
@@ -337,10 +341,12 @@ fn read_csi_with_params(first_digit: u8) -> Option<Event> {
         }
     }
 
-    let param: u32 = std::str::from_utf8(&digits).ok()?.split(';').next()?.parse().ok()?;
+    let raw = std::str::from_utf8(&digits).ok()?;
+    let params: Vec<u32> = raw.split(';').map(|s| s.parse().unwrap_or(0)).collect();
+    let first = *params.first()?;
 
-    if final_byte == b'~' {
-        match param {
+    match final_byte {
+        b'~' => match first {
             1 | 7 => Some(Event::Key(Key::Home)),
             2 => Some(Event::Key(Key::Ins)),
             3 => Some(Event::Key(Key::Del)),
@@ -360,9 +366,15 @@ fn read_csi_with_params(first_digit: u8) -> Option<Event> {
             23 => Some(Event::Key(Key::F11)),
             24 => Some(Event::Key(Key::F12)),
             _ => None,
+        },
+        // DEC mode 2048 in-band size report: `CSI 48 ; rows ; cols [; py ; px] t`.
+        b't' if first == 48 && params.len() >= 3 => {
+            let rows = params[1] as u16;
+            let cols = params[2] as u16;
+            terminal::set_screen_size(cols, rows);
+            Some(Event::WindowResize)
         }
-    } else {
-        None
+        _ => None,
     }
 }
 

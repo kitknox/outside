@@ -30,16 +30,34 @@ pub fn set_raw(enabled: bool) {
     }
 }
 
-/// Read terminal dimensions from the env vars the host sets at process
-/// launch. There is no SIGWINCH equivalent — these are a one-shot snapshot.
+use std::sync::atomic::{AtomicU16, Ordering};
+
+static COLS: AtomicU16 = AtomicU16::new(0);
+static ROWS: AtomicU16 = AtomicU16::new(0);
+
+/// Current terminal dimensions. Lazy-initialised from `COLUMNS` / `LINES` at
+/// process launch (the rootshell host sets both); updated thereafter by
+/// `set_screen_size`, which the WasiBackend CSI parser calls when libghostty
+/// sends a DEC mode 2048 size report (`CSI 48 ; rows ; cols ; py ; px t`).
 pub fn screen_size() -> (u16, u16) {
-    let cols = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(80);
-    let rows = std::env::var("LINES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    (cols, rows)
+    let mut c = COLS.load(Ordering::Relaxed);
+    let mut r = ROWS.load(Ordering::Relaxed);
+    if c == 0 || r == 0 {
+        c = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80);
+        r = std::env::var("LINES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        COLS.store(c, Ordering::Relaxed);
+        ROWS.store(r, Ordering::Relaxed);
+    }
+    (c, r)
+}
+
+pub fn set_screen_size(cols: u16, rows: u16) {
+    COLS.store(cols, Ordering::Relaxed);
+    ROWS.store(rows, Ordering::Relaxed);
 }
